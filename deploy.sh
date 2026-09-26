@@ -2,65 +2,63 @@
 set -euo pipefail
 
 # ============================================================================
-# deploy.sh - turn a fresh Ubuntu/Debian VPS into a Claude-connectable
-#             Linux agent: a tmux-backed shell exposed over Streamable HTTP
-#             with automatic HTTPS.
+# deploy.sh - deploy linuxMCP behind Nginx + Let's Encrypt with x-api-key auth
 #
+# Original project:
 #   Author : Mahmoud Alkhatib
 #   YouTube: https://www.youtube.com/@malkhatib
 #   License: MIT - free to use, modify, and share. Keep this credit. :)
 #
+# KwSalem deployment profile:
+#   - Nginx reverse proxy (works alongside existing n8n/OpenClaw hosts)
+#   - Let's Encrypt via Certbot webroot
+#   - x-api-key protection at Nginx
+#   - MCP Python SDK pinned to v1 (<2) for FastMCP compatibility
+#
 # USAGE:
 #   sudo ./deploy.sh <domain> [admin-email]
-#   e.g.  sudo ./deploy.sh lmcp.malkhatib.com iam@malkhatib.com
+#   e.g. sudo ./deploy.sh mcp.example.com admin@example.com
 #
-# Run it from the SAME folder that contains linux_mcp_server.py.
-# Point your domain's A record at this VPS BEFORE running (Caddy needs it
-# for the TLS certificate).
+# Optional: pre-set MCP_API_KEY to use your own secret. If omitted, this script
+# generates a 64-hex-character key and stores it root-only.
 # ============================================================================
 
-# ---- settings you may want to tweak ----------------------------------------
 SERVICE_USER="mcpagent"
 APP_DIR="/opt/linux-mcp"
 PORT="8080"
-
-# Give the agent root powers (so Claude can install packages, manage services,
-# etc.). FALSE = safe, user-level only. TRUE = full sysadmin. Demo with care.
 GRANT_SUDO="false"
-
-# Lock port 443 so ONLY Claude's cloud can reach the server. Fill from
-# Anthropic's published IP ranges. Empty = allow any source IP (NOT advised
-# for a public shell).  e.g. ANTHROPIC_IPS=("160.79.104.0/23")
-ANTHROPIC_IPS=()
-# ----------------------------------------------------------------------------
+WEBROOT="/var/www/acme"
+NGINX_SITE="/etc/nginx/sites-available/mcp"
+NGINX_LINK="/etc/nginx/sites-enabled/mcp"
+CREDS_FILE="/root/linux-mcp-credentials.txt"
 
 DOMAIN="${1:-}"
 EMAIL="${2:-admin@${DOMAIN:-example.com}}"
+API_KEY="${MCP_API_KEY:-}"
 
 [[ -z "$DOMAIN" ]] && { echo "Usage: sudo ./deploy.sh <domain> [email]"; exit 1; }
-[[ $EUID -ne 0 ]]  && { echo "Please run with sudo / as root."; exit 1; }
+[[ $EUID -ne 0 ]] && { echo "Please run with sudo / as root."; exit 1; }
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 [[ -f "$SRC_DIR/linux_mcp_server.py" ]] || {
-  echo "linux_mcp_server.py not found next to this script."; exit 1; }
+  echo "linux_mcp_server.py not found next to this script."; exit 1;
+}
 
-echo ">> [1/8] Installing base packages..."
+if [[ -z "$API_KEY" ]]; then
+  API_KEY="$(openssl rand -hex 32 2>/dev/null || true)"
+fi
+[[ -n "$API_KEY" ]] || { echo "Could not generate MCP API key."; exit 1; }
+
+# Keep generated Nginx config safe because it contains the API key.
+umask 077
+
+echo ">> [1/9] Installing base packages..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y tmux python3 python3-venv python3-pip ufw curl gnupg \
-                   debian-keyring debian-archive-keyring apt-transport-https
+apt-get install -y tmux python3 python3-venv python3-pip nginx certbot \
+                   python3-certbot-nginx ufw curl openssl
 
-echo ">> [2/8] Installing Caddy (automatic HTTPS)..."
-if ! command -v caddy >/dev/null 2>&1; then
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-    | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-    | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-  apt-get update -y
-  apt-get install -y caddy
-fi
-
-echo ">> [3/8] Creating low-privilege service user '$SERVICE_USER'..."
+echo ">> [2/9] Creating low-privilege service user '$SERVICE_USER'..."
 id -u "$SERVICE_USER" >/dev/null 2>&1 || \
   useradd --create-home --shell /bin/bash "$SERVICE_USER"
 
@@ -70,18 +68,19 @@ if [[ "$GRANT_SUDO" == "true" ]]; then
   chmod 440 "/etc/sudoers.d/$SERVICE_USER"
 fi
 
-echo ">> [4/8] Installing the MCP server..."
+echo ">> [3/9] Installing the MCP server..."
 mkdir -p "$APP_DIR"
 cp "$SRC_DIR/linux_mcp_server.py" "$APP_DIR/"
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
-"$APP_DIR/venv/bin/pip" install --quiet mcp uvicorn
+# linux_mcp_server.py uses FastMCP from the MCP v1 SDK. MCP 2.x renamed this API.
+"$APP_DIR/venv/bin/pip" install --quiet --upgrade 'mcp<2' uvicorn
 touch "$APP_DIR/audit.log"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 
-echo ">> [5/8] Creating systemd service..."
+echo ">> [4/9] Creating systemd service..."
 NNP="true"; [[ "$GRANT_SUDO" == "true" ]] && NNP="false"
-cat >/etc/systemd/system/linux-mcp.service <<EOF
+cat >/etc/systemd/system/linux-mcp.service <<EOF_SERVICE
 [Unit]
 Description=Linux VPS Agent (MCP server)
 After=network.target
@@ -100,54 +99,136 @@ NoNewPrivileges=$NNP
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SERVICE
 systemctl daemon-reload
 systemctl enable linux-mcp.service
 systemctl restart linux-mcp.service
 
-echo ">> [6/8] Configuring Caddy reverse proxy + TLS for $DOMAIN..."
-if [[ ${#ANTHROPIC_IPS[@]} -gt 0 ]]; then
-  RANGES="${ANTHROPIC_IPS[*]}"
-  cat >/etc/caddy/Caddyfile <<EOF
-$DOMAIN {
-    tls $EMAIL
-    @claude remote_ip $RANGES
-    handle @claude {
-        reverse_proxy 127.0.0.1:$PORT
-    }
-    handle {
-        respond "Forbidden" 403
-    }
+echo ">> [5/9] Verifying linuxMCP on 127.0.0.1:$PORT..."
+for _ in $(seq 1 30); do
+  if ss -lnt | grep -q "127.0.0.1:$PORT"; then break; fi
+  sleep 1
+done
+ss -lnt | grep -q "127.0.0.1:$PORT" || {
+  systemctl status linux-mcp --no-pager || true
+  journalctl -u linux-mcp -n 50 --no-pager || true
+  echo "linuxMCP did not start on port $PORT."; exit 1;
 }
-EOF
-else
-  cat >/etc/caddy/Caddyfile <<EOF
-$DOMAIN {
-    tls $EMAIL
-    reverse_proxy 127.0.0.1:$PORT
-}
-EOF
-fi
-systemctl restart caddy
 
-echo ">> [7/8] Firewall (ufw)..."
+echo ">> [6/9] Preparing Nginx HTTP site for Let's Encrypt..."
+mkdir -p "$WEBROOT/.well-known/acme-challenge"
+cat >"$NGINX_SITE" <<EOF_HTTP
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root $WEBROOT;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering off;
+    }
+}
+EOF_HTTP
+chmod 600 "$NGINX_SITE"
+ln -sfn "$NGINX_SITE" "$NGINX_LINK"
+nginx -t
+systemctl reload nginx
+
+echo ">> [7/9] Issuing / reusing Let's Encrypt certificate..."
+certbot certonly --webroot -w "$WEBROOT" \
+  --non-interactive --agree-tos --no-eff-email \
+  --email "$EMAIL" --keep-until-expiring -d "$DOMAIN"
+
+echo ">> [8/9] Enabling HTTPS + x-api-key protection..."
+cat >"$NGINX_SITE" <<EOF_HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root $WEBROOT;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+
+    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    location /mcp {
+        if (\$http_x_api_key != "$API_KEY") {
+            return 401;
+        }
+
+        proxy_pass http://127.0.0.1:$PORT/mcp;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+EOF_HTTPS
+chmod 600 "$NGINX_SITE"
+nginx -t
+systemctl reload nginx
+
+echo ">> [9/9] Firewall + credentials..."
 ufw allow 22/tcp
 ufw allow 80/tcp
-if [[ ${#ANTHROPIC_IPS[@]} -gt 0 ]]; then
-  for cidr in "${ANTHROPIC_IPS[@]}"; do ufw allow from "$cidr" to any port 443 proto tcp; done
-else
-  ufw allow 443/tcp
-fi
+ufw allow 443/tcp
 ufw --force enable
 
-echo ">> [8/8] Done."
+cat >"$CREDS_FILE" <<EOF_CREDS
+linuxMCP endpoint: https://$DOMAIN/mcp
+Claude authentication: No sign-in
+Request header name: x-api-key
+Request header value: $API_KEY
+EOF_CREDS
+chmod 600 "$CREDS_FILE"
+
+HTTP_CODE="$(curl -sk -o /dev/null -w '%{http_code}' "https://$DOMAIN/mcp" || true)"
+if [[ "$HTTP_CODE" != "401" ]]; then
+  echo "WARNING: expected unauthenticated /mcp to return 401, got: ${HTTP_CODE:-none}"
+fi
+
 echo "--------------------------------------------------------------"
-echo " MCP endpoint :  https://$DOMAIN/mcp"
-echo " Add in Claude:  Settings > Connectors > Add custom connector"
-echo "                 paste the URL above (it is authless)"
-echo " Watch live   :  sudo -u $SERVICE_USER tmux attach -t claude"
-echo " Audit log    :  tail -f $APP_DIR/audit.log"
-echo " Sudo powers  :  GRANT_SUDO=$GRANT_SUDO"
+echo " MCP endpoint : https://$DOMAIN/mcp"
+echo " Claude auth  : No sign-in"
+echo " Header name  : x-api-key"
+echo " Header value : saved in $CREDS_FILE (root-only)"
+echo " Show secret  : sudo cat $CREDS_FILE"
+echo " Watch live   : sudo -u $SERVICE_USER tmux attach -t claude"
+echo " Audit log    : tail -f $APP_DIR/audit.log"
+echo " Sudo powers  : GRANT_SUDO=$GRANT_SUDO"
 echo "--------------------------------------------------------------"
 echo " Built by Mahmoud Alkhatib  |  https://www.youtube.com/@malkhatib"
+echo " KwSalem profile: Nginx + Certbot + x-api-key hardening"
 echo "--------------------------------------------------------------"
